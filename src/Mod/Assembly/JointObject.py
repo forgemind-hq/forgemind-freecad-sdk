@@ -26,23 +26,25 @@ import math
 import FreeCAD as App
 import Part
 
-from PySide import QtCore
-from PySide.QtCore import QT_TRANSLATE_NOOP
+from PySide6 import QtCore
+from PySide6.QtCore import QT_TRANSLATE_NOOP
 from collections.abc import Sequence
 
 if App.GuiUp:
     import FreeCADGui as Gui
-    from PySide import QtGui, QtWidgets
+    from PySide6 import QtGui, QtWidgets
 
 __title__ = "Assembly Joint object"
 __author__ = "Ondsel"
 __url__ = "https://www.freecad.org"
 
-from pivy import coin
+if App.GuiUp:
+    from pivy import coin
 import UtilsAssembly
 import Preferences
 
-from SoSwitchMarker import SoSwitchMarker
+if App.GuiUp:
+    from SoSwitchMarker import SoSwitchMarker
 
 translate = App.Qt.translate
 

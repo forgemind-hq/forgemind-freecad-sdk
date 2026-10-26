@@ -22,7 +22,8 @@
 # **************************************************************************/
 
 import FreeCAD
-import FreeCADGui
+if FreeCAD.GuiUp:
+    import FreeCADGui
 
 translate = FreeCAD.Qt.translate
 
