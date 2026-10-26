@@ -70,3 +70,9 @@ files_to_translate.txt
 # pixi environments
 .pixi
 *.egg-info
+
+# ForgeCAD SDK build outputs
+/work/
+/dist/
+/forgecad/__pycache__/
+/forgecad/tests/__pycache__/

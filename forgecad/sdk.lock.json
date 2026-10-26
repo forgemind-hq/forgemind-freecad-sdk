@@ -1,0 +1,82 @@
+{
+  "archives": {
+    "AddonManager": {
+      "archive_sha256": "70b2fa7f3c58c0ea5be830de90d33369670ee6658f13aeb7684f1ea478528178",
+      "commit": "937b6877239dc78ef59eeefe8099e5f14243eda1",
+      "root_prefix": "AddonManager-937b6877239dc78ef59eeefe8099e5f14243eda1/",
+      "url": "https://codeload.github.com/FreeCAD/AddonManager/tar.gz/937b6877239dc78ef59eeefe8099e5f14243eda1"
+    },
+    "GSL": {
+      "archive_sha256": "dd06a9190c02f6c04d008366faabc8947c817f33cbc6a838c5bfc9ad79652410",
+      "commit": "543d0dd3fe966ddf20e884b44e5fdbf12cb43784",
+      "root_prefix": "GSL-543d0dd3fe966ddf20e884b44e5fdbf12cb43784/",
+      "url": "https://codeload.github.com/microsoft/GSL/tar.gz/543d0dd3fe966ddf20e884b44e5fdbf12cb43784"
+    },
+    "OndselSolver": {
+      "archive_sha256": "77646ca7d8cbc6dc4e8304439be2ff2b9aecf397e6349e63b3b06e65dfed79c3",
+      "commit": "30e9b64e8bf881d438d4b88834f9ba3674865418",
+      "root_prefix": "OndselSolver-30e9b64e8bf881d438d4b88834f9ba3674865418/",
+      "url": "https://codeload.github.com/FreeCAD/OndselSolver/tar.gz/30e9b64e8bf881d438d4b88834f9ba3674865418"
+    },
+    "cpython": {
+      "archive_sha256": "9b1e896523fc510691126c864406d9360a3d1e986acbda59cda57b5abda45b87",
+      "root_prefix": "Python-3.11.9/",
+      "url": "https://www.python.org/ftp/python/3.11.9/Python-3.11.9.tar.xz"
+    },
+    "freecad": {
+      "archive_sha256": "47739954479d95ef339e2f24ab30489fbae54e99afb74cafce4b969c2d1835c3",
+      "root_prefix": "FreeCAD-1.1.3/",
+      "url": "https://codeload.github.com/FreeCAD/FreeCAD/tar.gz/refs/tags/1.1.3"
+    },
+    "lib": {
+      "archive_sha256": "7ff5db23de232a39cbb5c9f5143c355885e30ac596161a6b9fc50c4538bfbf01",
+      "commit": "f8d7d77c06936315286eb55f8de22cd23c188571",
+      "root_prefix": "googletest-f8d7d77c06936315286eb55f8de22cd23c188571/",
+      "url": "https://codeload.github.com/google/googletest/tar.gz/f8d7d77c06936315286eb55f8de22cd23c188571"
+    },
+    "qtbase": {
+      "archive_sha256": "56001b905601bb9023d399f3ba780d7fa940f3e4861e496a7c490331f49e0b80",
+      "root_prefix": "qtbase-everywhere-src-6.8.3/",
+      "url": "https://download.qt.io/archive/qt/6.8/6.8.3/submodules/qtbase-everywhere-src-6.8.3.tar.xz"
+    }
+  },
+  "build_resources": {
+    "headless-assembly.json": "7854d2e8ce3b408fcc079e4234756e286f2828da36195a8c2bb795cf0c8d69c5",
+    "headless-dependencies.json": "257a1d83185d96e34f2d4d78350c0d33d4cc00107485ed75d7110657a25c9bd3",
+    "headless.cmake": "f4708bdcfd2ea4be2c2cb831abe8b090227a2041cf663e839f13008149805830",
+    "qt-literals.json": "b13bde3e886a62fd4cfaabac054272daf0643062b08017833f17d06c2a4d7e38"
+  },
+  "format": "forgecad.sdk.inputs.v1",
+  "freecad_version": "1.1.3",
+  "python_version": "3.11.9",
+  "python_wheels": {
+    "PySide6-Essentials": {
+      "archive_sha256": "fd57fa0c886ef99b3844173322c0023ec77cc946a0c9a0cdfbc2ac5c511053c1",
+      "filename": "PySide6_Essentials-6.8.3-cp39-abi3-manylinux_2_28_x86_64.whl",
+      "url": "https://files.pythonhosted.org/packages/f0/b2/3205336262bf88d57f01503df81ede2a0b1eecbb2a7d58978a5e5625f7c1/PySide6_Essentials-6.8.3-cp39-abi3-manylinux_2_28_x86_64.whl"
+    },
+    "shiboken6": {
+      "archive_sha256": "295a003466ca2cccf6660e2f2ceb5e6cef4af192a48a196a32d46b6f0c9ec5cb",
+      "filename": "shiboken6-6.8.3-cp39-abi3-manylinux_2_28_x86_64.whl",
+      "url": "https://files.pythonhosted.org/packages/76/a1/f1958c9d00176044ab00464cd89b6969ef3a7d2ed12d316ff1eda3dec88f/shiboken6-6.8.3-cp39-abi3-manylinux_2_28_x86_64.whl"
+    }
+  },
+  "resources": {
+    "contract.schema.json": "acfcc7540377f45858a3f05f9c2e4a7b6ee06b4a015c4e97809f6c9c83017f0b",
+    "forgecad-python-v1.patch": "eaf1860dacaa0bed541e2b288e02394c09af5ad6b85fe01074c8634368a1c0f4",
+    "forgecad_sdk_python_v1.h": "bd7d3d9803e4611c06c4b862d8f8c09c049ea49689bed0846cd7018e6b797659",
+    "patch-inputs.json": "6d7177c62fd69a523a30aa17d2de3e95359e7708e84f37c62aabfc44abf89dc9"
+  },
+  "submodules": {
+    "src/3rdParty/GSL": "GSL",
+    "src/3rdParty/OndselSolver": "OndselSolver",
+    "src/Mod/AddonManager": "AddonManager",
+    "tests/lib": "lib"
+  },
+  "target": "x86_64-unknown-linux-gnu",
+  "upstream": {
+    "commit": "145529fe741292ff0b3977a01195bf0247425794",
+    "tag": "1.1.3",
+    "url": "https://github.com/FreeCAD/FreeCAD.git"
+  }
+}
