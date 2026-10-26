@@ -22,6 +22,8 @@
  ***************************************************************************/
 
 #include <FCConfig.h>
+#define FORGECAD_SDK_BUILD_INTERNAL
+#include <Base/ForgeCADPythonIntegration.h>
 
 # if defined(FC_OS_LINUX) || defined(FC_OS_MACOSX) || defined(FC_OS_BSD)
 #  include <unistd.h>
@@ -2780,6 +2782,9 @@ void Application::initApplication()
         Base::Interpreter().runString(Base::ScriptFactory().ProduceScript("FreeCADInit"));
     }
     catch (const Base::Exception& e) {
+        FcPyReportV1 report{sizeof(FcPyReportV1), FC_PY_ABI_V1, 0, 0, 0, 0, 0, 0, 0, 0, {0}};
+        (void)forgecad_base_python_snapshot_v1(&report);
+        if (report.flags & FC_PY_REPORT_ATTEMPTED) { throw; }
         e.reportException();
     }
 

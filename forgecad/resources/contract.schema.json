@@ -1,0 +1,768 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://forgecad.local/schemas/sdk-python-v1",
+  "title": "ForgeCAD private SDK Python input/build/artifact contracts",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/build_contract"
+    },
+    {
+      "$ref": "#/$defs/prepared"
+    },
+    {
+      "$ref": "#/$defs/input_approval"
+    },
+    {
+      "$ref": "#/$defs/delivery"
+    },
+    {
+      "$ref": "#/$defs/layout_input"
+    },
+    {
+      "$ref": "#/$defs/artifact"
+    }
+  ],
+  "$defs": {
+    "target": {
+      "enum": [
+        "x86_64-unknown-linux-gnu",
+        "aarch64-apple-darwin",
+        "x86_64-pc-windows-msvc"
+      ]
+    },
+    "build_contract": {
+      "type": "object",
+      "properties": {
+        "schema_kind": {
+          "const": "forgecad.sdk.python.build-contract.v1"
+        },
+        "target": {
+          "$ref": "#/$defs/target"
+        },
+        "abi_version": {
+          "const": 65536
+        },
+        "sdk_release": {
+          "const": "1.1.3"
+        },
+        "python_hex": {
+          "const": 51055088
+        },
+        "upstream_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "patch_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "abi_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "nongenerated_source_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "compiler_delivery_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "input_approval_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "dependencies": {
+          "type": "object",
+          "minProperties": 4,
+          "maxProperties": 4
+        },
+        "cpython": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "const": "3.11.9"
+            },
+            "hex": {
+              "const": 51055088
+            },
+            "source_archive_sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "build_fingerprint": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "runtime_files": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^(?!/)(?![A-Za-z]:)(?!.*\\\\)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+              },
+              "minItems": 1
+            }
+          },
+          "required": [
+            "version",
+            "hex",
+            "source_archive_sha256",
+            "build_fingerprint",
+            "runtime_files"
+          ],
+          "additionalProperties": false
+        },
+        "toolchain": {
+          "type": "object",
+          "minProperties": 1
+        },
+        "anchor": {
+          "type": "object",
+          "properties": {
+            "package_root_from_module": {
+              "type": "string",
+              "minLength": 1
+            },
+            "app": {
+              "type": "string",
+              "pattern": "^(?!/)(?![A-Za-z]:)(?!.*\\\\)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+            },
+            "artifact_manifest": {
+              "type": "string",
+              "pattern": "^(?!/)(?![A-Za-z]:)(?!.*\\\\)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+            }
+          },
+          "required": [
+            "package_root_from_module",
+            "app",
+            "artifact_manifest"
+          ],
+          "additionalProperties": false
+        },
+        "layout": {
+          "type": "object",
+          "properties": {
+            "freecad_program": {
+              "type": "string",
+              "pattern": "^(?!/)(?![A-Za-z]:)(?!.*\\\\)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+            },
+            "python_home": {
+              "type": "string",
+              "pattern": "^(?!/)(?![A-Za-z]:)(?!.*\\\\)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+            },
+            "roles": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "role": {
+                    "enum": [
+                      "stdlib",
+                      "native",
+                      "freecad"
+                    ]
+                  },
+                  "path": {
+                    "type": "string",
+                    "pattern": "^(?!/)(?![A-Za-z]:)(?!.*\\\\)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+                  },
+                  "files": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "path": {
+                          "type": "string",
+                          "pattern": "^(?!/)(?![A-Za-z]:)(?!.*\\\\)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+                        },
+                        "sha256": {
+                          "type": "string",
+                          "pattern": "^[0-9a-f]{64}$"
+                        }
+                      },
+                      "required": [
+                        "path",
+                        "sha256"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "minItems": 0
+                  },
+                  "sha256": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$"
+                  },
+                  "artifacts": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "uniqueItems": true
+                  }
+                },
+                "required": [
+                  "role",
+                  "path",
+                  "files",
+                  "artifacts"
+                ],
+                "additionalProperties": false
+              },
+              "minItems": 3,
+              "maxItems": 3
+            },
+            "module_inventory": {
+              "type": "array",
+              "minItems": 4,
+              "items": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "kind": {
+                    "enum": [
+                      "builtin",
+                      "source",
+                      "extension"
+                    ]
+                  },
+                  "role": {
+                    "enum": [
+                      "app",
+                      "stdlib",
+                      "native",
+                      "freecad"
+                    ]
+                  },
+                  "path": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": [
+                  "name",
+                  "kind",
+                  "role",
+                  "path"
+                ],
+                "additionalProperties": false,
+                "allOf": [
+                  {
+                    "if": {
+                      "properties": {
+                        "kind": {
+                          "const": "source"
+                        }
+                      }
+                    },
+                    "then": {
+                      "properties": {
+                        "path": {
+                          "type": "string",
+                          "pattern": "\\.py$"
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "if": {
+                      "properties": {
+                        "kind": {
+                          "const": "builtin"
+                        }
+                      }
+                    },
+                    "then": {
+                      "properties": {
+                        "name": {
+                          "const": "FreeCAD"
+                        },
+                        "role": {
+                          "const": "app"
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "description": "Public CPython provider contract: SDK prepare binds required FreeCAD/Part/Sketcher/PartDesign uniquely to inventory members. Native definitions must be nonnull; source definitions null. FreeCAD static definition belongs to actual App module. File origins match canonical physical members; ZIP source origin matches canonical physical ZIP plus exact verified member suffix. The production consumers enforce cross-member/role/path constraints.",
+              "uniqueItems": true
+            }
+          },
+          "required": [
+            "freecad_program",
+            "python_home",
+            "roles",
+            "module_inventory"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "schema_kind",
+        "target",
+        "abi_version",
+        "sdk_release",
+        "python_hex",
+        "upstream_sha256",
+        "patch_sha256",
+        "abi_sha256",
+        "nongenerated_source_sha256",
+        "compiler_delivery_sha256",
+        "input_approval_sha256",
+        "dependencies",
+        "cpython",
+        "toolchain",
+        "anchor",
+        "layout"
+      ],
+      "additionalProperties": false
+    },
+    "prepared": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "const": "forgecad.sdk.python.prepared.v1"
+        },
+        "target": {
+          "$ref": "#/$defs/target"
+        },
+        "input_digest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "contract_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "build_contract": {
+          "$ref": "#/$defs/build_contract"
+        },
+        "source_files": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "mode": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 511
+              }
+            },
+            "required": [
+              "sha256",
+              "mode"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "compiler_source_after": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        },
+        "schema_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      },
+      "required": [
+        "kind",
+        "target",
+        "input_digest",
+        "contract_sha256",
+        "build_contract",
+        "source_files",
+        "compiler_source_after",
+        "schema_sha256"
+      ],
+      "additionalProperties": false
+    },
+    "input_approval": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "const": "forgecad.sdk.python.input-approval.v1"
+        },
+        "scope_approval_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "compiler_delivery": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          },
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "additionalProperties": false
+        },
+        "dependency_inputs_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "gitlinks_proof_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      },
+      "required": [
+        "kind",
+        "scope_approval_sha256",
+        "compiler_delivery",
+        "dependency_inputs_sha256",
+        "gitlinks_proof_sha256"
+      ],
+      "additionalProperties": false
+    },
+    "delivery": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "const": "forgecad.f03.accepted-delivery.v1"
+        },
+        "accepted": {
+          "const": true
+        },
+        "approval_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "baseline_files": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        },
+        "source_after": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        },
+        "changes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "^(?!/)(?![A-Za-z]:)(?!.*\\\\)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+              },
+              "before_sha256": {
+                "oneOf": [
+                  {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "after_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              }
+            },
+            "required": [
+              "path",
+              "before_sha256",
+              "after_sha256"
+            ],
+            "additionalProperties": false
+          },
+          "minItems": 0
+        }
+      },
+      "required": [
+        "kind",
+        "accepted",
+        "approval_sha256",
+        "baseline_files",
+        "source_after",
+        "changes"
+      ],
+      "additionalProperties": false,
+      "description": "Frozen full source-after, based on the historical 254-file overlay baseline. Only 11 F03 functional paths plus four exact controller-owned overlay restorations from pinned F02 normal_source_files may differ; production requires all four normal SHA values."
+    },
+    "layout_input": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "const": "forgecad.sdk.python.layout-input.v1"
+        },
+        "target": {
+          "$ref": "#/$defs/target"
+        },
+        "package_root": {
+          "type": "string",
+          "minLength": 1
+        },
+        "anchor": {
+          "type": "object",
+          "properties": {
+            "package_root_from_module": {
+              "type": "string",
+              "minLength": 1
+            },
+            "app": {
+              "type": "string",
+              "pattern": "^(?!/)(?![A-Za-z]:)(?!.*\\\\)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+            },
+            "artifact_manifest": {
+              "type": "string",
+              "pattern": "^(?!/)(?![A-Za-z]:)(?!.*\\\\)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+            }
+          },
+          "required": [
+            "package_root_from_module",
+            "app",
+            "artifact_manifest"
+          ],
+          "additionalProperties": false
+        },
+        "layout": {
+          "type": "object",
+          "properties": {
+            "freecad_program": {
+              "type": "string",
+              "pattern": "^(?!/)(?![A-Za-z]:)(?!.*\\\\)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+            },
+            "python_home": {
+              "type": "string",
+              "pattern": "^(?!/)(?![A-Za-z]:)(?!.*\\\\)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+            },
+            "roles": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "role": {
+                    "enum": [
+                      "stdlib",
+                      "native",
+                      "freecad"
+                    ]
+                  },
+                  "path": {
+                    "type": "string",
+                    "pattern": "^(?!/)(?![A-Za-z]:)(?!.*\\\\)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+                  },
+                  "files": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "path": {
+                          "type": "string",
+                          "pattern": "^(?!/)(?![A-Za-z]:)(?!.*\\\\)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+                        },
+                        "sha256": {
+                          "type": "string",
+                          "pattern": "^[0-9a-f]{64}$"
+                        }
+                      },
+                      "required": [
+                        "path",
+                        "sha256"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "minItems": 0
+                  },
+                  "sha256": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$"
+                  },
+                  "artifacts": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "uniqueItems": true
+                  }
+                },
+                "required": [
+                  "role",
+                  "path",
+                  "files",
+                  "artifacts"
+                ],
+                "additionalProperties": false
+              },
+              "minItems": 3,
+              "maxItems": 3
+            },
+            "module_inventory": {
+              "type": "array",
+              "minItems": 4,
+              "items": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "kind": {
+                    "enum": [
+                      "builtin",
+                      "source",
+                      "extension"
+                    ]
+                  },
+                  "role": {
+                    "enum": [
+                      "app",
+                      "stdlib",
+                      "native",
+                      "freecad"
+                    ]
+                  },
+                  "path": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": [
+                  "name",
+                  "kind",
+                  "role",
+                  "path"
+                ],
+                "additionalProperties": false,
+                "allOf": [
+                  {
+                    "if": {
+                      "properties": {
+                        "kind": {
+                          "const": "source"
+                        }
+                      }
+                    },
+                    "then": {
+                      "properties": {
+                        "path": {
+                          "type": "string",
+                          "pattern": "\\.py$"
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "if": {
+                      "properties": {
+                        "kind": {
+                          "const": "builtin"
+                        }
+                      }
+                    },
+                    "then": {
+                      "properties": {
+                        "name": {
+                          "const": "FreeCAD"
+                        },
+                        "role": {
+                          "const": "app"
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "description": "Public CPython provider contract: SDK prepare binds required FreeCAD/Part/Sketcher/PartDesign uniquely to inventory members. Native definitions must be nonnull; source definitions null. FreeCAD static definition belongs to actual App module. File origins match canonical physical members; ZIP source origin matches canonical physical ZIP plus exact verified member suffix. The production consumers enforce cross-member/role/path constraints.",
+              "uniqueItems": true
+            }
+          },
+          "required": [
+            "freecad_program",
+            "python_home",
+            "roles",
+            "module_inventory"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "kind",
+        "target",
+        "package_root",
+        "anchor",
+        "layout"
+      ],
+      "additionalProperties": false
+    },
+    "artifact": {
+      "type": "object",
+      "properties": {
+        "contract_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "target": {
+          "$ref": "#/$defs/target"
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "role": {
+                "enum": [
+                  "app",
+                  "base",
+                  "python",
+                  "bridge",
+                  "module"
+                ]
+              },
+              "path": {
+                "type": "string",
+                "pattern": "^(?!/)(?![A-Za-z]:)(?!.*\\\\)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+              },
+              "sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              }
+            },
+            "required": [
+              "role",
+              "path",
+              "sha256"
+            ],
+            "additionalProperties": false
+          },
+          "minItems": 4
+        }
+      },
+      "required": [
+        "contract_sha256",
+        "target",
+        "files"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

@@ -1,0 +1,1317 @@
+--- a/src/App/Application.cpp
++++ b/src/App/Application.cpp
+@@ -22,6 +22,8 @@
+  ***************************************************************************/
+ 
+ #include <FCConfig.h>
++#define FORGECAD_SDK_BUILD_INTERNAL
++#include <Base/ForgeCADPythonIntegration.h>
+ 
+ # if defined(FC_OS_LINUX) || defined(FC_OS_MACOSX) || defined(FC_OS_BSD)
+ #  include <unistd.h>
+@@ -2780,6 +2782,9 @@
+         Base::Interpreter().runString(Base::ScriptFactory().ProduceScript("FreeCADInit"));
+     }
+     catch (const Base::Exception& e) {
++        FcPyReportV1 report{sizeof(FcPyReportV1), FC_PY_ABI_V1, 0, 0, 0, 0, 0, 0, 0, 0, {0}};
++        (void)forgecad_base_python_snapshot_v1(&report);
++        if (report.flags & FC_PY_REPORT_ATTEMPTED) { throw; }
+         e.reportException();
+     }
+ 
+--- a/src/App/CMakeLists.txt
++++ b/src/App/CMakeLists.txt
+@@ -73,6 +73,7 @@
+ 
+ set(FreeCADApp_LIBS
+     FreeCADBase
++    ${CMAKE_DL_LIBS}
+     ${Boost_LIBRARIES}
+     fmt::fmt
+ )
+@@ -282,6 +283,7 @@
+     ${Document_CPP_SRCS}
+     ${Properties_CPP_SRCS}
+     Application.cpp
++    ForgeCADPythonIntegration.cpp
+     ApplicationDirectories.cpp
+     ApplicationDirectoriesPyImp.cpp
+     ApplicationPy.cpp
+@@ -382,3 +384,11 @@
+         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+     )
+ endif(WIN32)
++
++# ForgeCAD's SDK-private integration is built only from a prepared source copy.
++if(NOT EXISTS "${CMAKE_SOURCE_DIR}/src/ForgeCADPythonBuildContract.h")
++    message(FATAL_ERROR "ForgeCAD SDK source must be prepared with pinned dependency inputs")
++endif()
++if(NOT Python3_VERSION VERSION_EQUAL "3.11.9")
++    message(FATAL_ERROR "ForgeCAD SDK-private Python v1 requires CPython 3.11.9")
++endif()
+--- /dev/null
++++ b/src/App/ForgeCADPythonIntegration.cpp
+@@ -0,0 +1,641 @@
++// =============================================================================
++//    Copyright (c) 2026 Haixing Hu.
++//
++//    SPDX-License-Identifier: Apache-2.0
++//
++//    Licensed under the Apache License, Version 2.0 (the "License");
++//    you may not use this file except in compliance with the License.
++//    You may obtain a copy of the License at
++//
++//        http://www.apache.org/licenses/LICENSE-2.0
++//
++//    Unless required by applicable law or agreed to in writing, software
++//    distributed under the License is distributed on an "AS IS" BASIS,
++//    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++//    See the License for the specific language governing permissions and
++//    limitations under the License.
++// =============================================================================
++// SDK-private integration; application and interpreter remain SDK-owned.
++#define FORGECAD_SDK_BUILD_INTERNAL
++#include <Base/ForgeCADPythonIntegration.h>
++#include <ForgeCADPythonBuildContract.h>
++#include <Base/Interpreter.h>
++#include "Application.h"
++
++#include <algorithm>
++#include <atomic>
++#include <cstring>
++#include <cstdlib>
++#include <map>
++#include <memory>
++#include <stdexcept>
++#include <string>
++#include <thread>
++#include <vector>
++#include <QCryptographicHash>
++#include <QDir>
++#include <QFile>
++#include <QFileInfo>
++#include <QJsonArray>
++#include <QJsonDocument>
++#include <QJsonObject>
++#include <QJsonParseError>
++#include <QString>
++#ifdef _WIN32
++#include <windows.h>
++#else
++#include <dlfcn.h>
++#endif
++
++// F03_APP_STATE_BEGIN
++struct FcPyModuleProvider {
++    std::string name;
++    std::string kind;
++    QString physical_path;
++    QString zip_member;
++};
++struct FcPyContextV1 {
++    FcPyConfigV1 config{};
++    std::string program, home, application, user_parameter, system_parameter;
++    std::vector<std::string> paths;
++    std::vector<FcPyUtf8V1> path_views;
++    std::vector<FcPyModuleProvider> providers;
++    std::map<std::string, std::string> previous_config;
++    std::thread::id owner;
++    bool snapshot = false;
++    bool started = false;
++    bool entered_app = false;
++    bool app_ready = false;
++    bool terminal = false;
++    FcPyReportV1 report{sizeof(FcPyReportV1), FC_PY_ABI_V1, 0, 0, FC_PY_PREPARED,
++                        0, 0, 0, 0, FC_PY_STAGE_NONE, {0}};
++};
++namespace {
++std::atomic<bool> forgecad_app_used{false};
++std::atomic<bool> forgecad_app_poison{false};
++// Application::initConfig stores argv in process-global SDK state. This backing
++// belongs to the SDK process, including after an Unknown ctx is destroyed.
++// One-shot admission ensures it is never replaced while App could retain it.
++std::vector<char> forgecad_application_argument;
++char* forgecad_application_argv[2] = {nullptr,nullptr};
++const unsigned char forgecad_contract_sha[] = FC_PY_CONTRACT_SHA256_BYTES;
++const char forgecad_contract_json[] = FC_PY_CONTRACT_JSON;
++
++bool valid_report(const FcPyReportV1* out) noexcept
++{
++    return out && out->struct_size == sizeof(*out) && out->abi_version == FC_PY_ABI_V1;
++}
++bool valid_base_result(int32_t status, const FcPyReportV1& value, bool require_saved) noexcept
++{
++    if (!valid_report(&value) || status < 0 || status > FC_PY_E_POISONED
++        || static_cast<uint32_t>(status) != value.primary_status
++        || value.cleanup_status > FC_PY_E_POISONED || value.lifecycle > FC_PY_UNKNOWN
++        || value.python_state > 2 || value.gil_state > 2 || value.finalize_calls > 1
++        || (value.flags & ~31u) || value.failure_stage > FC_PY_STAGE_PROTECTION_RESTORE) {
++        return false;
++    }
++    return !require_saved || status != FC_PY_OK
++        || (value.lifecycle == FC_PY_SAVED && value.python_state == 1
++            && value.gil_state == 0 && value.finalize_calls == 0
++            && !(value.flags & FC_PY_REPORT_POISON));
++}
++void diagnostic(FcPyReportV1& report, const char* text) noexcept
++{
++    if (!text) { text = "SDK integration failed"; }
++    size_t length = std::min(std::strlen(text), sizeof(report.diagnostic)-1);
++    while (length && (static_cast<unsigned char>(text[length]) & 0xc0) == 0x80) { --length; }
++    std::memcpy(report.diagnostic, text, length);
++    report.diagnostic[length] = '\0';
++}
++int32_t result(FcPyContextV1& ctx, FcPyReportV1* out) noexcept
++{
++    *out = ctx.report;
++    return static_cast<int32_t>(ctx.report.primary_status);
++}
++int32_t error(FcPyReportV1* out, uint32_t code, const char* text) noexcept
++{
++    FcPyReportV1 value{sizeof(FcPyReportV1), FC_PY_ABI_V1, code, 0, FC_PY_COLD,
++                       0, 0, 0, 0, FC_PY_STAGE_PREPARE, {0}};
++    diagnostic(value, text);
++    *out = value;
++    return static_cast<int32_t>(code);
++}
++void unknown(FcPyContextV1& ctx, uint32_t stage, uint32_t primary, const char* text) noexcept
++{
++    FcPyReportV1 base{sizeof(FcPyReportV1), FC_PY_ABI_V1, 0, 0, 0, 0, 0, 0, 0, 0, {0}};
++    (void)forgecad_base_python_mark_unknown_v1(stage, &base);
++    ctx.report = base;
++    ctx.report.primary_status = primary;
++    if (ctx.entered_app) { ctx.report.flags |= FC_PY_REPORT_APP_ENTERED; }
++    if (ctx.app_ready) { ctx.report.flags |= FC_PY_REPORT_APP_READY; }
++    diagnostic(ctx.report, text);
++    ctx.terminal = true;
++    forgecad_app_poison.store(true, std::memory_order_release);
++}
++void launchers_absent()
++{
++    for (const char* key : {"PYTHONEXECUTABLE", "__PYVENV_LAUNCHER__"}) {
++        if (std::getenv(key)) { throw std::runtime_error("Python launcher environment must be absent"); }
++#ifdef _WIN32
++        const std::wstring wide(key, key + std::strlen(key));
++        SetLastError(ERROR_SUCCESS);
++        const DWORD needed = GetEnvironmentVariableW(wide.c_str(), nullptr, 0);
++        if (_wgetenv(wide.c_str()) || needed || GetLastError() != ERROR_ENVVAR_NOT_FOUND) {
++            throw std::runtime_error("Python launcher environment must be absent in every view");
++        }
++#endif
++    }
++}
++std::string copy_utf8(FcPyUtf8V1 value, uint64_t& total, bool allow_empty = false)
++{
++    if ((!value.data && value.size) || value.size > 1048576
++        || value.size > 16777216-total) { throw std::runtime_error("SDK input size exceeds limit"); }
++    if (!value.size) {
++        if (value.data || !allow_empty) { throw std::runtime_error("Invalid empty SDK UTF8 slice"); }
++        return {};
++    }
++    const auto size = static_cast<int>(value.size);
++    const std::string bytes(value.data, static_cast<size_t>(value.size));
++    if (bytes.find('\0') != std::string::npos
++        || QString::fromUtf8(bytes.data(), size).toUtf8() != QByteArray(bytes.data(), size)) {
++        throw std::runtime_error("SDK input is not strict Unicode UTF8");
++    }
++    total += value.size;
++    return bytes;
++}
++FcPyUtf8V1 view(const std::string& value) noexcept
++{
++    return value.empty() ? FcPyUtf8V1{nullptr,0} : FcPyUtf8V1{value.data(),value.size()};
++}
++// F03_APP_STATE_END
++
++// F03_APP_LAYOUT_BEGIN
++QString loaded_path(const void* address)
++{
++#ifdef _WIN32
++    HMODULE module = nullptr;
++    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
++                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                           reinterpret_cast<LPCWSTR>(address), &module)) {
++        throw std::runtime_error("Cannot identify loaded SDK module");
++    }
++    std::vector<wchar_t> buffer(32768);
++    const DWORD size = GetModuleFileNameW(module, buffer.data(), static_cast<DWORD>(buffer.size()));
++    if (!size || size >= buffer.size()) { throw std::runtime_error("SDK module path truncated"); }
++    return QFileInfo(QString::fromWCharArray(buffer.data(), static_cast<int>(size))).canonicalFilePath();
++#else
++    Dl_info info{};
++    if (!dladdr(address, &info) || !info.dli_fname) { throw std::runtime_error("Cannot identify loaded SDK module"); }
++    return QFileInfo(QString::fromUtf8(info.dli_fname)).canonicalFilePath();
++#endif
++}
++QString safe_member(const QString& root, const QString& relative)
++{
++    if (relative.isEmpty() || QDir::isAbsolutePath(relative)
++        || relative.contains('\\') || relative.split('/').contains("..")
++        || relative.split('/').contains(".")) { throw std::runtime_error("Invalid package-relative SDK member"); }
++    const QString path = QFileInfo(QDir(root).filePath(relative)).canonicalFilePath();
++    if (path.isEmpty() || (path != root && !path.startsWith(root + '/'))) {
++        throw std::runtime_error("SDK member escapes package root or is missing");
++    }
++    return path;
++}
++QJsonObject json_file(const QString& path)
++{
++    QFile file(path);
++    if (!file.open(QIODevice::ReadOnly) || file.size() > 16777216) {
++        throw std::runtime_error("SDK artifact manifest missing or oversized");
++    }
++    QJsonParseError parse;
++    const auto document = QJsonDocument::fromJson(file.readAll(), &parse);
++    if (parse.error != QJsonParseError::NoError || !document.isObject()) {
++        throw std::runtime_error("Invalid SDK artifact manifest JSON");
++    }
++    return document.object();
++}
++void check_sha(const QString& path, const QString& expected)
++{
++    const QByteArray bytes = expected.toLatin1();
++    if (bytes.size() != 64) { throw std::runtime_error("Invalid SDK content fingerprint"); }
++    for (const auto c : bytes) {
++        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
++            throw std::runtime_error("Invalid SDK content fingerprint");
++        }
++    }
++    QFile file(path);
++    QCryptographicHash hash(QCryptographicHash::Sha256);
++    if (!file.open(QIODevice::ReadOnly) || !hash.addData(&file) || hash.result().toHex() != bytes) {
++        throw std::runtime_error("SDK package content fingerprint mismatch");
++    }
++}
++void check_layout(FcPyContextV1& ctx)
++{
++    QJsonParseError parse;
++    const QJsonDocument document = QJsonDocument::fromJson(forgecad_contract_json, &parse);
++    if (parse.error != QJsonParseError::NoError || !document.isObject()) {
++        throw std::runtime_error("Invalid embedded SDK build contract");
++    }
++    const auto contract = document.object();
++    if (contract.value("schema_kind").toString() != "forgecad.sdk.python.build-contract.v1"
++        || contract.value("target").toString() != FC_PY_BUILD_TARGET) {
++        throw std::runtime_error("SDK build contract profile mismatch");
++    }
++    const auto anchor = contract.value("anchor").toObject();
++    const QString app = loaded_path(reinterpret_cast<const void*>(&forgecad_sdk_python_query_v1));
++    const QString root = QFileInfo(QDir(QFileInfo(app).absolutePath()).filePath(
++        anchor.value("package_root_from_module").toString())).canonicalFilePath();
++    if (root.isEmpty() || safe_member(root, anchor.value("app").toString()) != app) {
++        throw std::runtime_error("SDK module/package anchor mismatch");
++    }
++    const auto layout = contract.value("layout").toObject();
++    const QFileInfo program(QString::fromUtf8(ctx.program.c_str()));
++    if (!program.isAbsolute() || !program.isFile() || !program.isExecutable()
++        || program.canonicalFilePath() != safe_member(root,layout.value("freecad_program").toString())) {
++        throw std::runtime_error("Python program does not match the SDK executable");
++    }
++    for (const auto* parameter : {&ctx.user_parameter,&ctx.system_parameter}) {
++        const QFileInfo file(QString::fromUtf8(parameter->c_str()));
++        if (!file.isAbsolute() || !QFileInfo(file.absolutePath()).isDir()
++            || file.fileName()=="." || file.fileName()=="..") {
++            throw std::runtime_error("SDK parameter file must have an existing absolute parent");
++        }
++    }
++    const auto artifact = json_file(safe_member(root, anchor.value("artifact_manifest").toString()));
++    const QString digest = QString::fromLatin1(QByteArray(
++        reinterpret_cast<const char*>(forgecad_contract_sha), 32).toHex());
++    if (artifact.value("contract_sha256").toString() != digest
++        || artifact.value("target").toString() != FC_PY_BUILD_TARGET) {
++        throw std::runtime_error("SDK artifact/build contract mismatch");
++    }
++    std::map<QString,QString> loaded;
++    loaded["app"] = app;
++    loaded["base"] = loaded_path(reinterpret_cast<const void*>(&forgecad_base_python_profile_v1));
++    loaded["python"] = loaded_path(reinterpret_cast<const void*>(&Py_IsInitialized));
++    bool bridge = false;
++    std::map<QString,QString> artifact_hashes;
++    const auto artifacts = artifact.value("files").toArray();
++    for (const auto& value : artifacts) {
++        const auto file = value.toObject();
++        const auto role = file.value("role").toString();
++        const auto path = safe_member(root, file.value("path").toString());
++        const auto content_hash = file.value("sha256").toString();
++        check_sha(path, content_hash);
++        const auto previous = artifact_hashes.find(path);
++        if (previous != artifact_hashes.end() && previous->second != content_hash) {
++            throw std::runtime_error("Conflicting SDK artifact fingerprints");
++        }
++        artifact_hashes[path] = content_hash;
++        auto expected = loaded.find(role);
++        if (expected != loaded.end()) {
++            if (expected->second != path) { throw std::runtime_error("Loaded SDK dependency identity mismatch"); }
++            loaded.erase(expected);
++        }
++        if (role == "bridge") { bridge = true; }
++    }
++    if (!loaded.empty() || !bridge) { throw std::runtime_error("Incomplete SDK binary artifact manifest"); }
++    if (ctx.config.mode == FC_PY_MODE_EXPLICIT && QFileInfo(QString::fromUtf8(ctx.home.c_str())).canonicalFilePath()
++        != safe_member(root, layout.value("python_home").toString())) {
++        throw std::runtime_error("Python home does not match SDK package");
++    }
++    std::vector<QString> search;
++    for (const auto& item : ctx.paths) {
++        const QFileInfo file(QString::fromUtf8(item.c_str()));
++        const auto path = file.canonicalFilePath();
++        if (!file.isAbsolute() || path.isEmpty() || (!file.isDir()
++            && !(file.isFile() && file.suffix().compare("zip",Qt::CaseInsensitive)==0))) {
++            throw std::runtime_error("Invalid complete Python search member");
++        }
++        search.push_back(path);
++    }
++    bool stdlib = false, native = false, freecad = false;
++    for (const auto& value : layout.value("roles").toArray()) {
++        const auto role = value.toObject();
++        const auto path = safe_member(root, role.value("path").toString());
++        if (ctx.config.mode == FC_PY_MODE_EXPLICIT
++            && std::find(search.begin(), search.end(), path) == search.end()) {
++            throw std::runtime_error("Complete Python search list omits a required package root");
++        }
++        const auto name = role.value("role").toString();
++        stdlib = stdlib || name=="stdlib";
++        native = native || name=="native";
++        freecad = freecad || name=="freecad";
++        if (QFileInfo(path).isFile()) {
++            // The complete ZIP member inventory was verified by the source
++            // preparation tool. Runtime consumption binds the whole ZIP.
++            check_sha(path,role.value("sha256").toString());
++            continue;
++        }
++        for (const auto& item : role.value("files").toArray()) {
++            const auto file = item.toObject();
++            check_sha(safe_member(path,file.value("path").toString()),file.value("sha256").toString());
++        }
++        for (const auto& item : role.value("artifacts").toArray()) {
++            const auto member = safe_member(path,item.toString());
++            if (artifact_hashes.find(member) == artifact_hashes.end()) {
++                throw std::runtime_error("SDK output member absent from binary artifact manifest");
++            }
++        }
++    }
++    if (!stdlib || !native || !freecad) { throw std::runtime_error("SDK layout role inventory is incomplete"); }
++    // Bind the required imports to concrete package members before SDK globals
++    // change. The context owns these copies until start/stop/destroy completes.
++    std::map<QString,QJsonObject> roles;
++    for (const auto& value : layout.value("roles").toArray()) {
++        const auto role = value.toObject();
++        const auto name = role.value("role").toString();
++        if (!roles.emplace(name,role).second) { throw std::runtime_error("Duplicate SDK layout role"); }
++    }
++    std::map<QString,FcPyModuleProvider> providers;
++    std::map<QString,QString> identities;
++    for (const auto& value : layout.value("module_inventory").toArray()) {
++        const auto item = value.toObject();
++        const auto name = item.value("name").toString();
++        const auto kind = item.value("kind").toString();
++        const auto member = item.value("path").toString();
++        FcPyModuleProvider provider{name.toStdString(),kind.toStdString(),{}, {}};
++        if (name.isEmpty() || providers.find(name) != providers.end()) {
++            throw std::runtime_error("Missing/duplicate SDK import identity");
++        }
++        if (kind=="builtin") {
++            if (name!="FreeCAD" || item.value("role").toString()!="app"
++                || safe_member(root,member)!=app) { throw std::runtime_error("Invalid builtin SDK provider"); }
++            provider.physical_path=app;
++        } else {
++            const auto role=roles.find(item.value("role").toString());
++            if (role==roles.end() || (kind!="source" && kind!="extension")) {
++                throw std::runtime_error("Invalid SDK import role/kind");
++            }
++            if (member.isEmpty() || QDir::isAbsolutePath(member) || member.contains('\\')
++                || member.split('/').contains("..") || member.split('/').contains(".")
++                || member.split('/').contains("")) { throw std::runtime_error("Invalid SDK import member"); }
++            const auto base=safe_member(root,role->second.value("path").toString());
++            bool declared=false;
++            for (const auto& stable : role->second.value("files").toArray()) {
++                declared=declared || stable.toObject().value("path").toString()==member;
++            }
++            for (const auto& output : role->second.value("artifacts").toArray()) { declared=declared || output.toString()==member; }
++            if (!declared) { throw std::runtime_error("SDK provider absent from complete role inventory"); }
++            if (kind=="source") {
++                const auto leaf=name.section('.',-1);
++                const QFileInfo source(member);
++                if (!member.endsWith(".py") || (source.fileName()!=leaf+".py"
++                    && !(source.fileName()=="__init__.py" && QFileInfo(source.path()).fileName()==leaf))) {
++                    throw std::runtime_error("SDK source provider disagrees with import identity");
++                }
++            } else if (member.endsWith(".py")) { throw std::runtime_error("SDK extension provider is a Python source file"); }
++            if (QFileInfo(base).isFile()) {
++                if (kind!="source") { throw std::runtime_error("Native extensions cannot be loaded from ZIP roles"); }
++                provider.physical_path=base;
++                provider.zip_member=member;
++            } else { provider.physical_path=safe_member(base,member); }
++            const auto identity=provider.physical_path+(provider.zip_member.isEmpty()?QString{}:'/'+provider.zip_member);
++            if (!identities.emplace(identity,name).second) { throw std::runtime_error("Required SDK imports share a provider"); }
++        }
++        providers.emplace(name,std::move(provider));
++    }
++    for (const auto* name : {"FreeCAD","Part","Sketcher","PartDesign"}) {
++        const auto provider=providers.find(name);
++        if (provider==providers.end()) { throw std::runtime_error("Required SDK module inventory is incomplete"); }
++        ctx.providers.push_back(provider->second);
++    }
++}
++
++struct OwnedPythonReference {
++    PyObject* value;
++    explicit OwnedPythonReference(PyObject* object) noexcept : value(object) {}
++    ~OwnedPythonReference() { if (value) { Py_DECREF(value); } }
++    OwnedPythonReference(const OwnedPythonReference&)=delete;
++    OwnedPythonReference& operator=(const OwnedPythonReference&)=delete;
++};
++void check_import_provider(const FcPyModuleProvider& provider, PyObject* imported)
++{
++    // All APIs below are public CPython 3.11 APIs, called with the SDK-held GIL.
++    // A module definition pointer is never dereferenced or passed across the ABI.
++    if (!PyModule_Check(imported)) { throw std::runtime_error("SDK import is not a module"); }
++    const auto definition=PyModule_GetDef(imported);
++    if (provider.kind=="builtin") {
++        // FreeCAD's fixed init_freecad_module uses an App-local static PyModuleDef.
++        // PyCXX extension definitions may be heap allocated: do not owner-probe them.
++        if (!definition || loaded_path(static_cast<const void*>(definition))!=provider.physical_path) {
++            throw std::runtime_error("FreeCAD builtin provider is not the loaded SDK App");
++        }
++        return;
++    }
++    if ((provider.kind=="extension") != (definition!=nullptr)) {
++        throw std::runtime_error("SDK module provider kind mismatch");
++    }
++    OwnedPythonReference filename(PyModule_GetFilenameObject(imported));
++    if (!filename.value) { PyErr_Clear(); throw std::runtime_error("SDK module provider has no filename"); }
++    Py_ssize_t length=0;
++    const char* bytes=PyUnicode_AsUTF8AndSize(filename.value,&length);
++    if (!bytes || length<=0 || length>1048576 || std::memchr(bytes,0,static_cast<size_t>(length))) {
++        PyErr_Clear(); throw std::runtime_error("Invalid SDK provider Unicode filename");
++    }
++    const auto origin=QDir::fromNativeSeparators(QString::fromUtf8(bytes,static_cast<int>(length)));
++    if (provider.zip_member.isEmpty()) {
++        if (QFileInfo(origin).canonicalFilePath()!=provider.physical_path) {
++            throw std::runtime_error("Imported SDK module comes from a different provider");
++        }
++    } else {
++        // A ZIP origin is virtual. Resolve only its physical ZIP prefix, and
++        // compare its already verified canonical member as an exact suffix.
++        const auto suffix='/'+provider.zip_member;
++        if (!origin.endsWith(suffix) || QFileInfo(origin.left(origin.size()-suffix.size())).canonicalFilePath()!=provider.physical_path) {
++            throw std::runtime_error("Imported SDK source comes from a different ZIP/member");
++        }
++    }
++}
++// F03_APP_LAYOUT_END
++
++// F03_APP_LIFECYCLE_BEGIN
++int32_t FC_PY_CALL stop_sdk(FcPyContextV1* ctx, FcPyReportV1* out) noexcept;
++int32_t FC_PY_CALL prepare_sdk(const FcPyConfigV1* request, FcPyContextV1** output,
++                              FcPyReportV1* out) noexcept
++{
++    if (!valid_report(out)) { return FC_PY_E_ABI; }
++    if (!output) { return error(out,FC_PY_E_INPUT,"Missing SDK context output"); }
++    *output = nullptr;
++    if (!request || request->struct_size != sizeof(*request) || request->abi_version != FC_PY_ABI_V1) {
++        return error(out,FC_PY_E_ABI,"SDK configuration ABI mismatch");
++    }
++    if (forgecad_app_poison.load(std::memory_order_acquire)) { return error(out,FC_PY_E_POISONED,"SDK process state unknown"); }
++    if (forgecad_app_used.load(std::memory_order_acquire) || Py_IsInitialized()) { return error(out,FC_PY_E_ALREADY_USED,"Owned SDK requires a fresh process"); }
++    if (request->flags != 3 || request->mode > 1 || request->reserved[0] || request->reserved[1]
++        || request->path_count > 4096 || (!request->paths && request->path_count)) {
++        return error(out,FC_PY_E_INPUT,"Invalid SDK configuration fields");
++    }
++#ifndef FC_OS_LINUX
++    if (request->mode == FC_PY_MODE_SDK_AUTO) { return error(out,FC_PY_E_INPUT,"SDK_AUTO is Linux-only"); }
++#endif
++    try {
++        launchers_absent();
++        auto ctx = std::make_unique<FcPyContextV1>();
++        ctx->owner = std::this_thread::get_id();
++        uint64_t total = 0;
++        ctx->program = copy_utf8(request->program,total);
++        ctx->home = copy_utf8(request->python_home,total,request->mode==0);
++        ctx->application = copy_utf8(request->application_arg,total);
++        ctx->user_parameter = copy_utf8(request->user_parameter,total);
++        ctx->system_parameter = copy_utf8(request->system_parameter,total);
++        if (request->mode == 0 && (request->paths || request->path_count)) {
++            return error(out,FC_PY_E_INPUT,"SDK_AUTO must not override module paths");
++        }
++        for (uint64_t i=0; i<request->path_count; ++i) { ctx->paths.push_back(copy_utf8(request->paths[i],total)); }
++        if (request->mode == 1 && ctx->paths.empty()) { return error(out,FC_PY_E_INPUT,"Explicit module path list is empty"); }
++        for (const auto& path : ctx->paths) { ctx->path_views.push_back(view(path)); }
++        ctx->config = *request;
++        ctx->config.program=view(ctx->program); ctx->config.python_home=view(ctx->home);
++        ctx->config.application_arg=view(ctx->application); ctx->config.user_parameter=view(ctx->user_parameter);
++        ctx->config.system_parameter=view(ctx->system_parameter);
++        ctx->config.paths=ctx->path_views.empty()?nullptr:ctx->path_views.data();
++        check_layout(*ctx);
++        *out = ctx->report;
++        *output = ctx.release();
++        return FC_PY_OK;
++    }
++    catch (const std::bad_alloc&) { return error(out,FC_PY_E_NOMEM,"SDK configuration allocation failed"); }
++    catch (const std::exception& e) { return error(out,FC_PY_E_INPUT,e.what()); }
++    catch (...) { return error(out,FC_PY_E_INPUT,"SDK configuration preflight failed"); }
++}
++int32_t FC_PY_CALL start_sdk(FcPyContextV1* ctx, FcPyReportV1* out) noexcept
++{
++    if (!valid_report(out)) { return FC_PY_E_ABI; }
++    if (!ctx) { return error(out,FC_PY_E_INPUT,"Missing SDK context"); }
++    if (ctx->owner != std::this_thread::get_id()) { return error(out,FC_PY_E_THREAD,"SDK start on wrong thread"); }
++    if (ctx->started || ctx->terminal) { return error(out,FC_PY_E_STATE,"SDK context already started or terminal"); }
++    try { launchers_absent(); }
++    catch (...) { return error(out,FC_PY_E_INPUT,"Python launcher environment must be absent"); }
++    bool expected = false;
++    if (!forgecad_app_used.compare_exchange_strong(expected,true,std::memory_order_acq_rel)) {
++        return error(out,FC_PY_E_ALREADY_USED,"SDK owned initialization is one-shot");
++    }
++    ctx->started = true;
++    int32_t base_result = forgecad_base_python_initialize_v1(&ctx->config,&ctx->report);
++    if (!valid_base_result(base_result,ctx->report,true)) {
++        unknown(*ctx,FC_PY_STAGE_INITIALIZE,FC_PY_E_UNKNOWN,"Base report protocol mismatch");
++        return result(*ctx,out);
++    }
++    if (base_result != FC_PY_OK) {
++        ctx->terminal = true;
++        if (ctx->report.flags & FC_PY_REPORT_POISON) { forgecad_app_poison.store(true,std::memory_order_release); }
++        return result(*ctx,out);
++    }
++    try {
++        {
++            Base::PyGILStateLocker gil;
++            ctx->report.failure_stage = FC_PY_STAGE_APP_CONFIG;
++            ctx->previous_config = App::Application::Config();
++            ctx->snapshot = true;
++            App::Application::Config()["UserParameter"]=ctx->user_parameter;
++            App::Application::Config()["SystemParameter"]=ctx->system_parameter;
++            App::Application::Config()["RunMode"]="Console";
++            forgecad_application_argument.assign(ctx->application.begin(),ctx->application.end());
++            forgecad_application_argument.push_back(0);
++            forgecad_application_argv[0]=forgecad_application_argument.data();
++            ctx->entered_app = true;
++            ctx->report.flags |= FC_PY_REPORT_APP_ENTERED;
++            ctx->report.failure_stage = FC_PY_STAGE_APP_INITIALIZE;
++            App::Application::init(1,forgecad_application_argv);
++            ctx->app_ready = true;
++            ctx->report.flags |= FC_PY_REPORT_APP_READY;
++            ctx->report.lifecycle = FC_PY_APP_READY;
++            ctx->report.failure_stage = FC_PY_STAGE_IMPORT;
++            for (const auto& provider : ctx->providers) {
++                OwnedPythonReference imported(PyImport_ImportModule(provider.name.c_str()));
++                if (!imported.value) { PyErr_Clear(); throw std::runtime_error("Required FreeCAD Python module import failed"); }
++                check_import_provider(provider,imported.value);
++            }
++        }
++        ctx->report.lifecycle = FC_PY_READY;
++        ctx->report.failure_stage = FC_PY_STAGE_NONE;
++        ctx->report.gil_state = 0;
++        return result(*ctx,out);
++    }
++    catch (const std::exception& e) { diagnostic(ctx->report,e.what()); }
++    catch (...) { diagnostic(ctx->report,"SDK application initialization failed"); }
++    ctx->report.primary_status = ctx->app_ready ? FC_PY_E_IMPORT : FC_PY_E_APP;
++    if (ctx->entered_app && !ctx->app_ready) {
++        unknown(*ctx,FC_PY_STAGE_APP_INITIALIZE,FC_PY_E_APP,"Partial SDK App initialization cannot be destructed safely");
++        return result(*ctx,out);
++    }
++    return stop_sdk(ctx,out);
++}
++int32_t FC_PY_CALL stop_sdk(FcPyContextV1* ctx, FcPyReportV1* out) noexcept
++{
++    if (!valid_report(out)) { return FC_PY_E_ABI; }
++    if (!ctx) { return error(out,FC_PY_E_INPUT,"Missing SDK context"); }
++    if (ctx->terminal) { return result(*ctx,out); }
++    if (ctx->owner != std::this_thread::get_id()) {
++        unknown(*ctx,FC_PY_STAGE_THREAD,FC_PY_E_THREAD,"SDK stop on wrong thread");
++        return result(*ctx,out);
++    }
++    if (!ctx->started) {
++        ctx->report.lifecycle=FC_PY_CLOSED;
++        ctx->report.flags |= FC_PY_REPORT_CLEANUP_COMPLETE;
++        ctx->terminal=true;
++        return result(*ctx,out);
++    }
++    const uint32_t primary = ctx->report.primary_status;
++    try {
++        if (ctx->app_ready) { App::Application::destruct(); }
++        else { (void)forgecad_base_python_finalize_before_app_v1(&ctx->report); }
++        FcPyReportV1 base{sizeof(FcPyReportV1), FC_PY_ABI_V1, 0, 0, 0, 0, 0, 0, 0, 0, {0}};
++        const int32_t snapshot_status = forgecad_base_python_snapshot_v1(&base);
++        if (!valid_base_result(snapshot_status,base,false)) {
++            unknown(*ctx,FC_PY_STAGE_DESTRUCT,FC_PY_E_UNKNOWN,"Base cleanup report protocol mismatch");
++            return result(*ctx,out);
++        }
++        ctx->report = base;
++        if (primary) { ctx->report.primary_status=primary; }
++        if (ctx->entered_app) { ctx->report.flags |= FC_PY_REPORT_APP_ENTERED; }
++        if (ctx->app_ready) { ctx->report.flags |= FC_PY_REPORT_APP_READY; }
++        if (base.lifecycle != FC_PY_CLOSED && base.lifecycle != FC_PY_CLOSED_FAULT) {
++            unknown(*ctx,FC_PY_STAGE_DESTRUCT,primary?primary:static_cast<uint32_t>(FC_PY_E_CLEANUP),"SDK cleanup did not reach a known terminal state");
++            return result(*ctx,out);
++        }
++        if (ctx->snapshot) { App::Application::Config().swap(ctx->previous_config); ctx->snapshot=false; }
++        ctx->terminal=true;
++        if (ctx->report.cleanup_status) { forgecad_app_poison.store(true,std::memory_order_release); }
++        return result(*ctx,out);
++    }
++    catch (...) {
++        unknown(*ctx,FC_PY_STAGE_DESTRUCT,primary?primary:static_cast<uint32_t>(FC_PY_E_CLEANUP),"Partial SDK destruction cannot be retried");
++        return result(*ctx,out);
++    }
++}
++int32_t FC_PY_CALL destroy_sdk(FcPyContextV1* ctx, FcPyReportV1* out) noexcept
++{
++    if (!valid_report(out)) { return FC_PY_E_ABI; }
++    if (!ctx) { return error(out,FC_PY_E_INPUT,"Missing SDK context"); }
++    if (ctx->started && !ctx->terminal) { return error(out,FC_PY_E_STATE,"Stop SDK before destroying active context"); }
++    std::unique_ptr<FcPyContextV1> owned(ctx);
++    *out=ctx->report;
++    out->primary_status=FC_PY_OK; // freeing copies does not receipt interpreter recovery
++    if (!ctx->started) { out->lifecycle=FC_PY_CLOSED; out->flags |= FC_PY_REPORT_CLEANUP_COMPLETE; }
++    return FC_PY_OK;
++}
++} // namespace
++// F03_APP_LIFECYCLE_END
++
++// F03_APP_QUERY_BEGIN
++extern "C" AppExport int32_t FC_PY_CALL forgecad_sdk_python_query_v1(
++    uint32_t version, uint32_t size, FcPyApiV1* out) noexcept
++{
++    if (!out || version != FC_PY_ABI_V1 || size != sizeof(*out)) { return FC_PY_E_ABI; }
++    if (forgecad_app_poison.load(std::memory_order_acquire)) { return FC_PY_E_POISONED; }
++    FcPyBaseProfileV1 base{};
++    const int32_t status=forgecad_base_python_profile_v1(FC_PY_ABI_V1,sizeof(base),&base);
++    if (status != FC_PY_OK) { return status; }
++    if (base.struct_size != sizeof(base) || base.abi_version != FC_PY_ABI_V1
++        || base.features != FC_PY_FEATURES_V1 || base.python_hex != FC_PY_PYTHON_HEX_V1
++        || base.pointer_bits != 64 || base.wchar_bits != sizeof(wchar_t)*8
++        || base.reserved[0] || base.reserved[1]
++        || std::memcmp(base.contract_sha256,forgecad_contract_sha,32)) { return FC_PY_E_VERSION; }
++    const FcPyApiV1 api{sizeof(FcPyApiV1),FC_PY_ABI_V1,FC_PY_FEATURES_V1,
++        FC_PY_SDK_RELEASE_V1,FC_PY_PYTHON_HEX_V1,64,sizeof(wchar_t)*8,0,
++        FC_PY_CONTRACT_SHA256_BYTES,{forgecad_contract_json,sizeof(forgecad_contract_json)-1},
++        &prepare_sdk,&start_sdk,&stop_sdk,&destroy_sdk};
++    *out=api;
++    return FC_PY_OK;
++}
++// F03_APP_QUERY_END
+--- /dev/null
++++ b/src/Base/ForgeCADPythonIntegration.h
+@@ -0,0 +1,184 @@
++// =============================================================================
++//    Copyright (c) 2026 Haixing Hu.
++//
++//    SPDX-License-Identifier: Apache-2.0
++//
++//    Licensed under the Apache License, Version 2.0 (the "License");
++//    you may not use this file except in compliance with the License.
++//    You may obtain a copy of the License at
++//
++//        http://www.apache.org/licenses/LICENSE-2.0
++//
++//    Unless required by applicable law or agreed to in writing, software
++//    distributed under the License is distributed on an "AS IS" BASIS,
++//    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++//    See the License for the specific language governing permissions and
++//    limitations under the License.
++// =============================================================================
++// SDK-private ABI. See native/README.md for the complete approved contract.
++// query is read-only and writes nothing on failure. All callback reports must
++// be nonnull with exact struct_size/abi_version before use; invalid reports are
++// never written. prepare sets *ctx=NULL before validating a valid configuration
++// boundary, deepcopies UTF8 bytes and borrows no caller buffer after return.
++// start/stop are serialized on prepare's thread, entered without a held GIL.
++// int return must equal report.primary_status; an OK destroy only receipts ctx
++// memory release, not interpreter recovery. Only SDK destroy frees SDK contexts.
++// API/contract bytes and callback code stay borrowed from process-mapped SDK.
++#ifndef FORGECAD_SDK_PYTHON_V1_H
++#define FORGECAD_SDK_PYTHON_V1_H
++#include <stdint.h>
++#if defined(FORGECAD_SDK_BUILD_INTERNAL)
++# include <FCConfig.h>
++# define FC_PY_APP_EXPORT AppExport
++# define FC_PY_BASE_EXPORT BaseExport
++#else
++# define FC_PY_APP_EXPORT
++# define FC_PY_BASE_EXPORT
++#endif
++#if defined(_WIN32)
++# define FC_PY_CALL __cdecl
++#else
++# define FC_PY_CALL
++#endif
++#ifdef __cplusplus
++# define FC_PY_NOEXCEPT noexcept
++extern "C" {
++#else
++# define FC_PY_NOEXCEPT
++#endif
++#define FC_PY_ABI_V1 0x00010000u
++#define FC_PY_FLAG_NO_USER_SITE 1u
++#define FC_PY_FLAG_NO_BYTECODE 2u
++#define FC_PY_MODE_SDK_AUTO 0u
++#define FC_PY_MODE_EXPLICIT 1u
++
++
++#define FC_PY_FEATURES_V1 31u
++#define FC_PY_SDK_RELEASE_V1 0x00010103u
++#define FC_PY_PYTHON_HEX_V1 0x030b09f0u
++enum FcPyStatusV1 {
++    FC_PY_OK=0, FC_PY_E_ABI=1, FC_PY_E_INPUT=2, FC_PY_E_VERSION=3,
++    FC_PY_E_ALREADY_USED=4, FC_PY_E_THREAD=5, FC_PY_E_STATE=6,
++    FC_PY_E_NOMEM=7, FC_PY_E_INIT=8, FC_PY_E_STDOUT=9, FC_PY_E_APP=10,
++    FC_PY_E_IMPORT=11, FC_PY_E_CLEANUP=12, FC_PY_E_UNKNOWN=13, FC_PY_E_POISONED=14
++};
++enum FcPyLifecycleV1 {
++    FC_PY_COLD=0, FC_PY_PREPARED=1, FC_PY_PREINITIALIZING=2,
++    FC_PY_PYTHON_HELD=3, FC_PY_STDOUT_READY=4, FC_PY_SAVED=5,
++    FC_PY_APP_ENTERING=6, FC_PY_APP_READY=7, FC_PY_READY=8,
++    FC_PY_FINALIZING=9, FC_PY_CLOSED=10, FC_PY_CLOSED_FAULT=11, FC_PY_UNKNOWN=12
++};
++enum FcPyStageV1 {
++    FC_PY_STAGE_NONE=0, FC_PY_STAGE_CAPABILITY=1, FC_PY_STAGE_PREPARE=2,
++    FC_PY_STAGE_PREINITIALIZE=3, FC_PY_STAGE_CONFIG=4, FC_PY_STAGE_INITIALIZE=5,
++    FC_PY_STAGE_STDOUT=6, FC_PY_STAGE_SAVE_THREAD=7, FC_PY_STAGE_PATH_READ=8,
++    FC_PY_STAGE_APP_CONFIG=9, FC_PY_STAGE_APP_INITIALIZE=10,
++    FC_PY_STAGE_IMPORT=11, FC_PY_STAGE_DESTRUCT=12, FC_PY_STAGE_FINALIZE=13,
++    FC_PY_STAGE_THREAD=14, FC_PY_STAGE_PROTECTION_RESTORE=15
++};
++#define FC_PY_REPORT_POISON 1u
++#define FC_PY_REPORT_APP_ENTERED 2u
++#define FC_PY_REPORT_APP_READY 4u
++#define FC_PY_REPORT_ATTEMPTED 8u
++#define FC_PY_REPORT_CLEANUP_COMPLETE 16u
++
++typedef struct FcPyUtf8V1 {
++    const char *data;
++    uint64_t size;
++} FcPyUtf8V1;
++
++typedef struct FcPyConfigV1 {
++    uint32_t struct_size;       /* 128 */
++    uint32_t abi_version;       /* FC_PY_ABI_V1 */
++    uint32_t flags;             /* exactly 3 */
++    uint32_t mode;              /* 0 or 1 */
++    FcPyUtf8V1 program;         /* offset 16 */
++    FcPyUtf8V1 python_home;     /* offset 32 */
++    const FcPyUtf8V1 *paths;    /* offset 48 */
++    uint64_t path_count;        /* offset 56 */
++    FcPyUtf8V1 application_arg; /* offset 64 */
++    FcPyUtf8V1 user_parameter;  /* offset 80; isolated absolute file path */
++    FcPyUtf8V1 system_parameter;/* offset 96 */
++    uint64_t reserved[2];       /* offset 112; zero */
++} FcPyConfigV1;
++
++typedef struct FcPyReportV1 {
++    uint32_t struct_size;       /* 296 */
++    uint32_t abi_version;
++    uint32_t primary_status;
++    uint32_t cleanup_status;
++    uint32_t lifecycle;
++    uint32_t python_state;      /* 0 no, 1 yes, 2 unknown */
++    uint32_t gil_state;         /* 0 detached, 1 held, 2 unknown */
++    uint32_t finalize_calls;    /* actual calls, 0 or 1 */
++    uint32_t flags;             /* poison=1, app_entered=2, app_ready=4,
++                                  python_attempted=8, cleanup_complete=16 */
++    uint32_t failure_stage;
++    char diagnostic[256];      /* SDK-owned value copied into caller output */
++} FcPyReportV1;
++
++typedef struct FcPyContextV1 FcPyContextV1; /* opaque SDK allocation */
++typedef int32_t (FC_PY_CALL *FcPyPrepareV1)(
++    const FcPyConfigV1 *, FcPyContextV1 **, FcPyReportV1 *) FC_PY_NOEXCEPT;
++typedef int32_t (FC_PY_CALL *FcPyStartV1)(
++    FcPyContextV1 *, FcPyReportV1 *) FC_PY_NOEXCEPT;
++typedef int32_t (FC_PY_CALL *FcPyStopV1)(
++    FcPyContextV1 *, FcPyReportV1 *) FC_PY_NOEXCEPT;
++typedef int32_t (FC_PY_CALL *FcPyDestroyV1)(
++    FcPyContextV1 *, FcPyReportV1 *) FC_PY_NOEXCEPT;
++
++typedef struct FcPyApiV1 {
++    uint32_t struct_size;       /* 112 */
++    uint32_t abi_version;
++    uint32_t features;          /* exactly 0x1f */
++    uint32_t sdk_release;       /* 0x00010103 = FreeCAD 1.1.3 */
++    uint32_t python_hex;        /* 0x030b09f0 */
++    uint32_t pointer_bits;      /* 64 */
++    uint32_t wchar_bits;        /* Windows16, Linux/macOS32 */
++    uint32_t reserved;          /* 0 */
++    uint8_t contract_sha256[32];/* offset 32; hash of canonical contract JSON */
++    FcPyUtf8V1 contract_json;   /* offset 64; borrowed immutable UTF8, no NUL required */
++    FcPyPrepareV1 prepare;      /* offset 80 */
++    FcPyStartV1 start;          /* offset 88 */
++    FcPyStopV1 stop;            /* offset 96 */
++    FcPyDestroyV1 destroy;      /* offset 104 */
++} FcPyApiV1;
++
++typedef int32_t (FC_PY_CALL *FcPyQueryV1)(
++    uint32_t requested_abi, uint32_t output_size, FcPyApiV1 *output) FC_PY_NOEXCEPT;
++/* Definition uses AppExport (SDK FCConfig.h), plus the default C calling convention. */
++FC_PY_APP_EXPORT int32_t FC_PY_CALL forgecad_sdk_python_query_v1(
++    uint32_t requested_abi, uint32_t output_size, FcPyApiV1 *output) FC_PY_NOEXCEPT;
++#ifdef __cplusplus
++}
++#endif
++#if defined(FORGECAD_SDK_BUILD_INTERNAL)
++#ifdef __cplusplus
++extern "C" {
++#endif
++typedef struct FcPyBaseProfileV1 {
++    uint32_t struct_size;       /* 64 */
++    uint32_t abi_version;
++    uint32_t features;
++    uint32_t python_hex;
++    uint32_t pointer_bits;
++    uint32_t wchar_bits;
++    uint32_t reserved[2];
++    uint8_t contract_sha256[32];
++} FcPyBaseProfileV1;
++/* All definitions carry existing BaseExport. */
++FC_PY_BASE_EXPORT int32_t FC_PY_CALL forgecad_base_python_profile_v1(
++    uint32_t requested_abi, uint32_t output_size, FcPyBaseProfileV1 *) FC_PY_NOEXCEPT;
++FC_PY_BASE_EXPORT int32_t FC_PY_CALL forgecad_base_python_initialize_v1(
++    const FcPyConfigV1 *, FcPyReportV1 *) FC_PY_NOEXCEPT;
++FC_PY_BASE_EXPORT int32_t FC_PY_CALL forgecad_base_python_finalize_before_app_v1(
++    FcPyReportV1 *) FC_PY_NOEXCEPT;
++FC_PY_BASE_EXPORT int32_t FC_PY_CALL forgecad_base_python_snapshot_v1(
++    FcPyReportV1 *) FC_PY_NOEXCEPT;
++FC_PY_BASE_EXPORT int32_t FC_PY_CALL forgecad_base_python_mark_unknown_v1(
++    uint32_t failure_stage, FcPyReportV1 *) FC_PY_NOEXCEPT;
++#ifdef __cplusplus
++}
++#endif
++#endif /* FORGECAD_SDK_BUILD_INTERNAL */
++#endif /* FORGECAD_SDK_PYTHON_V1_H */
+--- a/src/Base/Interpreter.cpp
++++ b/src/Base/Interpreter.cpp
+@@ -24,6 +24,14 @@
+  ***************************************************************************/
+ 
+ #include <sstream>
++#include <atomic>
++#include <algorithm>
++#include <cstring>
++#include <thread>
++#include <vector>
++#define FORGECAD_SDK_BUILD_INTERNAL
++#include "ForgeCADPythonIntegration.h"
++#include "../ForgeCADPythonBuildContract.h"
+ #include <boost/regex.hpp>
+ 
+ #include <FCConfig.h>
+@@ -36,6 +44,162 @@
+ #include "PyTools.h"
+ #include "Stream.h"
+ 
++
++// F03_BASE_STATE_BEGIN
++namespace {
++struct ForgeCADPythonState {
++    std::atomic<bool> poison{false};
++    bool used = false;
++    bool active = false;
++    bool saved_valid = false;
++    bool singleton_live = false;
++    bool held = false;
++    const FcPyConfigV1* pending = nullptr; // synchronous, SDK-owned input only
++    std::thread::id owner;
++    FcPyReportV1 report{sizeof(FcPyReportV1), FC_PY_ABI_V1, 0, 0, FC_PY_COLD,
++                        0, 0, 0, 0, FC_PY_STAGE_NONE, {0}};
++};
++ForgeCADPythonState forgecad_python;
++
++bool forgecad_report_valid(const FcPyReportV1* out) noexcept
++{
++    return out && out->struct_size == sizeof(FcPyReportV1)
++        && out->abi_version == FC_PY_ABI_V1;
++}
++void forgecad_diagnostic(FcPyReportV1& report, const char* text) noexcept
++{
++    if (!text) { text = "SDK Python operation failed"; }
++    size_t n = std::min(std::strlen(text), sizeof(report.diagnostic) - 1);
++    while (n && (static_cast<unsigned char>(text[n]) & 0xc0) == 0x80) { --n; }
++    std::memcpy(report.diagnostic, text, n);
++    report.diagnostic[n] = '\0';
++}
++int32_t forgecad_base_result(FcPyReportV1* out) noexcept
++{
++    *out = forgecad_python.report;
++    return static_cast<int32_t>(out->primary_status);
++}
++void forgecad_unknown(uint32_t stage, const char* text) noexcept
++{
++    auto& r = forgecad_python.report;
++    forgecad_python.poison.store(true, std::memory_order_release);
++    r.flags |= FC_PY_REPORT_POISON;
++    r.flags &= ~FC_PY_REPORT_CLEANUP_COMPLETE;
++    r.cleanup_status = FC_PY_E_UNKNOWN;
++    r.lifecycle = FC_PY_UNKNOWN;
++    r.gil_state = 2;
++    r.python_state = 2;
++    r.failure_stage = stage;
++    if (r.primary_status == FC_PY_OK) { r.primary_status = FC_PY_E_UNKNOWN; }
++    forgecad_diagnostic(r, text);
++}
++} // namespace
++// F03_BASE_STATE_END
++
++// F03_CONFIG_CONSUMER_BEGIN
++namespace {
++std::wstring forgecad_wide(FcPyUtf8V1 input)
++{
++    if ((!input.data && input.size) || input.size > 1048576) {
++        throw Base::RuntimeError("Invalid SDK Python UTF8 input");
++    }
++    std::wstring result;
++    for (uint64_t i = 0; i < input.size;) {
++        uint32_t c = static_cast<unsigned char>(input.data[i++]);
++        uint32_t minimum = 0;
++        unsigned remaining = 0;
++        if (c == 0) { throw Base::RuntimeError("NUL in SDK Python input"); }
++        if (c < 0x80) { /* complete ASCII scalar */ }
++        else if (c >= 0xc2 && c <= 0xdf) { c &= 0x1f; remaining = 1; minimum = 0x80; }
++        else if (c >= 0xe0 && c <= 0xef) { c &= 0x0f; remaining = 2; minimum = 0x800; }
++        else if (c >= 0xf0 && c <= 0xf4) { c &= 7; remaining = 3; minimum = 0x10000; }
++        else { throw Base::RuntimeError("Invalid SDK Python UTF8 scalar"); }
++        if (remaining > input.size - i) { throw Base::RuntimeError("Truncated UTF8"); }
++        for (unsigned j = 0; j < remaining; ++j) {
++            const uint32_t b = static_cast<unsigned char>(input.data[i++]);
++            if ((b & 0xc0) != 0x80) { throw Base::RuntimeError("Invalid UTF8 continuation"); }
++            c = (c << 6) | (b & 0x3f);
++        }
++        if (c < minimum || c > 0x10ffff || (c >= 0xd800 && c <= 0xdfff)) {
++            throw Base::RuntimeError("Invalid Unicode scalar");
++        }
++        if (sizeof(wchar_t) == 2 && c > 0xffff) {
++            c -= 0x10000;
++            result.push_back(static_cast<wchar_t>(0xd800 + (c >> 10)));
++            result.push_back(static_cast<wchar_t>(0xdc00 + (c & 0x3ff)));
++        }
++        else { result.push_back(static_cast<wchar_t>(c)); }
++    }
++    return result;
++}
++void forgecad_check_status(PyStatus status)
++{
++    if (PyStatus_Exception(status)) {
++        throw Base::RuntimeError(status.err_msg ? status.err_msg : "Python initialization requested exit");
++    }
++}
++void forgecad_configure_python(const FcPyConfigV1& request)
++{
++    auto& state = forgecad_python;
++    auto& r = state.report;
++    PyConfig config;
++    PyConfig_InitIsolatedConfig(&config);
++    struct ClearConfig {
++        PyConfig* value;
++        ~ClearConfig() { PyConfig_Clear(value); }
++    } clear{&config};
++    config.isolated = 0;
++    config.use_environment = 0;
++    config.user_site_directory = 0;
++    config.write_bytecode = 0;
++    // Decode every input before the first potentially global CPython operation.
++    auto program = forgecad_wide(request.program);
++    std::wstring home;
++    std::vector<std::wstring> paths;
++    if (request.mode == FC_PY_MODE_EXPLICIT) {
++        home = forgecad_wide(request.python_home);
++        for (uint64_t i = 0; i < request.path_count; ++i) {
++            paths.push_back(forgecad_wide(request.paths[i]));
++        }
++    }
++    r.lifecycle = FC_PY_PREINITIALIZING;
++    r.failure_stage = FC_PY_STAGE_PREINITIALIZE;
++    r.flags |= FC_PY_REPORT_ATTEMPTED;
++    r.gil_state = 2;
++    PyPreConfig preconfig;
++    PyPreConfig_InitIsolatedConfig(&preconfig);
++    // These are exactly the four config overrides of _PyPreConfig_GetConfig.
++    preconfig.isolated = 0;
++    preconfig.use_environment = 0;
++    preconfig.parse_argv = 0;
++    preconfig.dev_mode = 0;
++    forgecad_check_status(Py_PreInitialize(&preconfig));
++    r.failure_stage = FC_PY_STAGE_CONFIG;
++    wchar_t* argv[] = {program.data()};
++    forgecad_check_status(PyConfig_SetArgv(&config, 1, argv));
++    if (request.mode == FC_PY_MODE_EXPLICIT) {
++        forgecad_check_status(PyConfig_SetString(&config, &config.program_name, program.c_str()));
++        forgecad_check_status(PyConfig_SetString(&config, &config.executable, program.c_str()));
++        forgecad_check_status(PyConfig_SetString(&config, &config.base_executable, program.c_str()));
++        forgecad_check_status(PyConfig_SetString(&config, &config.home, home.c_str()));
++        for (const auto& path : paths) {
++            forgecad_check_status(PyWideStringList_Append(&config.module_search_paths, path.c_str()));
++        }
++        config.module_search_paths_set = 1;
++    }
++    r.failure_stage = FC_PY_STAGE_INITIALIZE;
++    const PyStatus status = Py_InitializeFromConfig(&config);
++    if (Py_IsInitialized() && PyGILState_Check()) {
++        state.held = true;
++        r.python_state = 1;
++        r.gil_state = 1;
++        r.lifecycle = FC_PY_PYTHON_HELD;
++    }
++    forgecad_check_status(status);
++    if (!state.held) { throw Base::RuntimeError("SDK initialization returned without a known GIL"); }
++}
++} // namespace
++// F03_CONFIG_CONSUMER_END
+ 
+ char format2[1024];  // Warning! Can't go over 512 characters!!!
+ unsigned int format2_len = 1024;
+@@ -649,10 +813,40 @@
+ }  // namespace
+ std::string InterpreterSingleton::init(int argc, char* argv[])
+ {
++    if (forgecad_python.active) {
++        auto& state = forgecad_python;
++        auto& r = state.report;
++        if (state.owner != std::this_thread::get_id()) {
++            throw Base::RuntimeError("SDK Python initialization on wrong thread");
++        }
++        if (!state.pending) {
++            if (!state.saved_valid || state.poison.load(std::memory_order_acquire)) {
++                throw Base::RuntimeError("SDK Python has no valid saved interpreter");
++            }
++            return getPythonPath();
++        }
++        forgecad_configure_python(*state.pending);
++        r.failure_stage = FC_PY_STAGE_STDOUT;
++        PythonStdOutput::init_type();
++        r.lifecycle = FC_PY_STDOUT_READY;
++        r.failure_stage = FC_PY_STAGE_SAVE_THREAD;
++        // Private thread-state operations remain inside their original member.
++        state.held = false; // a throwing/faulted SaveThread result is unknown
++        r.gil_state = 2;
++        this->_global = PyEval_SaveThread();
++        if (!this->_global) {
++            forgecad_unknown(FC_PY_STAGE_SAVE_THREAD, "SDK SaveThread returned NULL");
++            throw Base::RuntimeError("SDK SaveThread returned NULL");
++        }
++        state.saved_valid = true;
++        r.gil_state = 0;
++        r.lifecycle = FC_PY_SAVED;
++        r.failure_stage = FC_PY_STAGE_PATH_READ;
++        return getPythonPath();
++    }
+     try {
+         if (!Py_IsInitialized()) {
+             initInterpreter(argc, argv);
+-
+             PythonStdOutput::init_type();
+             this->_global = PyEval_SaveThread();
+         }
+@@ -680,6 +874,59 @@
+ 
+ void InterpreterSingleton::finalize()
+ {
++    if (forgecad_python.active) {
++        auto& state = forgecad_python;
++        auto& r = state.report;
++        if (r.finalize_calls || r.lifecycle == FC_PY_CLOSED
++            || r.lifecycle == FC_PY_CLOSED_FAULT || r.lifecycle == FC_PY_UNKNOWN) {
++            return;
++        }
++        if (state.owner != std::this_thread::get_id()
++            || (!state.held && !state.saved_valid)) {
++            forgecad_unknown(FC_PY_STAGE_FINALIZE, "SDK cannot prove finalize ownership");
++            return;
++        }
++        r.lifecycle = FC_PY_FINALIZING;
++        r.failure_stage = FC_PY_STAGE_FINALIZE;
++        try {
++            if (state.saved_valid) {
++                auto* saved = this->_global;
++                this->_global = nullptr;
++                state.saved_valid = false;
++                if (!saved) {
++                    forgecad_unknown(FC_PY_STAGE_FINALIZE, "SDK saved thread state is NULL");
++                    return;
++                }
++                PyEval_RestoreThread(saved);
++                state.held = true;
++            }
++            try { cleanupModules(); }
++            catch (...) {
++                r.cleanup_status = FC_PY_E_CLEANUP;
++                forgecad_diagnostic(r, "SDK cleanupModules failed; attempting known-held finalize");
++            }
++            // Record before calling: a failing finalizer must never be retried.
++            r.finalize_calls = 1;
++            const int result = Py_FinalizeEx();
++            state.held = false;
++            r.gil_state = 0;
++            r.python_state = Py_IsInitialized() ? 1 : 0;
++            if (r.python_state) {
++                forgecad_unknown(FC_PY_STAGE_FINALIZE, "Python remains initialized after finalize");
++                return;
++            }
++            if (result < 0) { r.cleanup_status = FC_PY_E_CLEANUP; }
++            r.lifecycle = r.cleanup_status ? FC_PY_CLOSED_FAULT : FC_PY_CLOSED;
++            if (r.cleanup_status) {
++                if (!r.primary_status) { r.primary_status = FC_PY_E_CLEANUP; }
++                state.poison.store(true, std::memory_order_release);
++                r.flags |= FC_PY_REPORT_POISON;
++            }
++            else { r.flags |= FC_PY_REPORT_CLEANUP_COMPLETE; }
++        }
++        catch (...) { forgecad_unknown(FC_PY_STAGE_FINALIZE, "SDK finalize threw"); }
++        return;
++    }
+     try {
+         PyEval_RestoreThread(this->_global);
+         cleanupModules();
+@@ -720,6 +967,10 @@
+ 
+ void InterpreterSingleton::Destruct()
+ {
++    if (forgecad_python.active) {
++        if (!forgecad_python.singleton_live) { return; }
++        forgecad_python.singleton_live = false;
++    }
+     // not initialized or double destruct!
+     assert(_pcSingleton);
+     delete _pcSingleton;
+@@ -1025,3 +1276,141 @@
+     // none of the SWIG's succeeded
+     throw Base::RuntimeError("No SWIG wrapped library loaded");
+ }
++
++// F03_BASE_EXPORTS_BEGIN
++namespace {
++int32_t forgecad_base_error(FcPyReportV1* out, uint32_t code, const char* text) noexcept
++{
++    FcPyReportV1 report{sizeof(FcPyReportV1), FC_PY_ABI_V1, code, 0, FC_PY_COLD,
++                         0, 0, 0, 0, FC_PY_STAGE_CAPABILITY, {0}};
++    forgecad_diagnostic(report, text);
++    *out = report;
++    return static_cast<int32_t>(code);
++}
++}
++extern "C" BaseExport int32_t FC_PY_CALL forgecad_base_python_profile_v1(
++    uint32_t version, uint32_t size, FcPyBaseProfileV1* out) noexcept
++{
++    if (!out || version != FC_PY_ABI_V1 || size != sizeof(*out)) { return FC_PY_E_ABI; }
++    if (forgecad_python.poison.load(std::memory_order_acquire)) { return FC_PY_E_POISONED; }
++    if (PY_VERSION_HEX != FC_PY_PYTHON_HEX_V1 || sizeof(void*) != 8
++        || Py_Version != FC_PY_PYTHON_HEX_V1) { return FC_PY_E_VERSION; }
++    const FcPyBaseProfileV1 profile{sizeof(FcPyBaseProfileV1), FC_PY_ABI_V1,
++        FC_PY_FEATURES_V1, FC_PY_PYTHON_HEX_V1, 64, sizeof(wchar_t) * 8, {0, 0},
++        FC_PY_CONTRACT_SHA256_BYTES};
++    *out = profile;
++    return FC_PY_OK;
++}
++extern "C" BaseExport int32_t FC_PY_CALL forgecad_base_python_snapshot_v1(
++    FcPyReportV1* out) noexcept
++{
++    if (!forgecad_report_valid(out)) { return FC_PY_E_ABI; }
++    return forgecad_base_result(out);
++}
++extern "C" BaseExport int32_t FC_PY_CALL forgecad_base_python_mark_unknown_v1(
++    uint32_t stage, FcPyReportV1* out) noexcept
++{
++    if (!forgecad_report_valid(out)) { return FC_PY_E_ABI; }
++    if (stage >= FC_PY_STAGE_APP_INITIALIZE && stage <= FC_PY_STAGE_DESTRUCT) {
++        forgecad_python.report.flags |= FC_PY_REPORT_APP_ENTERED;
++    }
++    forgecad_unknown(stage, "SDK process state cannot be safely rolled back");
++    return forgecad_base_result(out);
++}
++extern "C" BaseExport int32_t FC_PY_CALL forgecad_base_python_finalize_before_app_v1(
++    FcPyReportV1* out) noexcept
++{
++    if (!forgecad_report_valid(out)) { return FC_PY_E_ABI; }
++    auto& state = forgecad_python;
++    auto& r = state.report;
++    if (r.lifecycle == FC_PY_CLOSED || r.lifecycle == FC_PY_CLOSED_FAULT
++        || r.lifecycle == FC_PY_UNKNOWN) { return forgecad_base_result(out); }
++    if (!state.active || state.owner != std::this_thread::get_id()
++        || (r.flags & FC_PY_REPORT_APP_ENTERED)) {
++        forgecad_unknown(FC_PY_STAGE_FINALIZE, "SDK pre-App finalize ownership is invalid");
++        return forgecad_base_result(out);
++    }
++    try {
++        if (!(r.flags & FC_PY_REPORT_ATTEMPTED)) {
++            r.lifecycle = FC_PY_CLOSED;
++            r.flags |= FC_PY_REPORT_CLEANUP_COMPLETE;
++        }
++        else if (state.held || state.saved_valid) { Base::Interpreter().finalize(); }
++        else { forgecad_unknown(r.failure_stage, "CPython partial initialization cannot be finalized"); }
++        if (state.singleton_live
++            && (r.lifecycle == FC_PY_CLOSED || r.lifecycle == FC_PY_CLOSED_FAULT)) {
++            Base::InterpreterSingleton::Destruct();
++        }
++    }
++    catch (...) { forgecad_unknown(FC_PY_STAGE_FINALIZE, "SDK pre-App cleanup threw"); }
++    return forgecad_base_result(out);
++}
++extern "C" BaseExport int32_t FC_PY_CALL forgecad_base_python_initialize_v1(
++    const FcPyConfigV1* request, FcPyReportV1* out) noexcept
++{
++    if (!forgecad_report_valid(out)) { return FC_PY_E_ABI; }
++    if (!request || request->struct_size != sizeof(*request)
++        || request->abi_version != FC_PY_ABI_V1) {
++        return forgecad_base_error(out, FC_PY_E_ABI, "SDK configuration ABI mismatch");
++    }
++    FcPyBaseProfileV1 profile{};
++    const int32_t available = forgecad_base_python_profile_v1(FC_PY_ABI_V1, sizeof(profile), &profile);
++    if (available != FC_PY_OK) {
++        return forgecad_base_error(out, available, "SDK Python capability unavailable");
++    }
++    if (forgecad_python.used || Py_IsInitialized()) {
++        return forgecad_base_error(out, FC_PY_E_ALREADY_USED, "SDK owned interpreter is one-shot");
++    }
++    if (request->flags != 3 || request->mode > FC_PY_MODE_EXPLICIT
++        || request->reserved[0] || request->reserved[1]
++        || request->path_count > 4096 || (!request->paths && request->path_count)) {
++        return forgecad_base_error(out, FC_PY_E_INPUT, "Invalid SDK Python configuration");
++    }
++    try {
++        if (forgecad_wide(request->program).empty()) {
++            return forgecad_base_error(out, FC_PY_E_INPUT, "Empty Python program");
++        }
++        if (request->mode == FC_PY_MODE_EXPLICIT) {
++            if (forgecad_wide(request->python_home).empty() || request->path_count == 0) {
++                return forgecad_base_error(out, FC_PY_E_INPUT, "Incomplete explicit Python paths");
++            }
++            for (uint64_t i = 0; i < request->path_count; ++i) {
++                if (forgecad_wide(request->paths[i]).empty()) {
++                    return forgecad_base_error(out, FC_PY_E_INPUT, "Empty Python search item");
++                }
++            }
++        }
++        else if (request->python_home.data || request->python_home.size
++                 || request->paths || request->path_count) {
++            return forgecad_base_error(out, FC_PY_E_INPUT, "SDK_AUTO must not override paths");
++        }
++    }
++    catch (...) { return forgecad_base_error(out, FC_PY_E_INPUT, "Invalid Unicode Python input"); }
++    auto& state = forgecad_python;
++    state.used = true;
++    state.active = true;
++    state.owner = std::this_thread::get_id();
++    state.pending = request;
++    struct ClearPending {
++        ~ClearPending() { forgecad_python.pending = nullptr; }
++    } pending_guard;
++    try {
++        auto& interpreter = Base::Interpreter();
++        state.singleton_live = true;
++        interpreter.init(0, nullptr);
++        state.report.failure_stage = FC_PY_STAGE_NONE;
++        return forgecad_base_result(out);
++    }
++    catch (const std::exception& error) {
++        state.report.primary_status = state.report.failure_stage == FC_PY_STAGE_STDOUT
++            ? FC_PY_E_STDOUT : FC_PY_E_INIT;
++        forgecad_diagnostic(state.report, error.what());
++    }
++    catch (...) {
++        state.report.primary_status = state.report.failure_stage == FC_PY_STAGE_STDOUT
++            ? FC_PY_E_STDOUT : FC_PY_E_INIT;
++        forgecad_diagnostic(state.report, "SDK interpreter initialization threw");
++    }
++    return forgecad_base_python_finalize_before_app_v1(out);
++}
++// F03_BASE_EXPORTS_END

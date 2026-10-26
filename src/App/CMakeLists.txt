@@ -73,6 +73,7 @@ target_include_directories(
 
 set(FreeCADApp_LIBS
     FreeCADBase
+    ${CMAKE_DL_LIBS}
     ${Boost_LIBRARIES}
     fmt::fmt
 )
@@ -282,6 +283,7 @@ SET(FreeCADApp_CPP_SRCS
     ${Document_CPP_SRCS}
     ${Properties_CPP_SRCS}
     Application.cpp
+    ForgeCADPythonIntegration.cpp
     ApplicationDirectories.cpp
     ApplicationDirectoriesPyImp.cpp
     ApplicationPy.cpp
@@ -382,3 +384,11 @@ else(WIN32)
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     )
 endif(WIN32)
+
+# ForgeCAD's SDK-private integration is built only from a prepared source copy.
+if(NOT EXISTS "${CMAKE_SOURCE_DIR}/src/ForgeCADPythonBuildContract.h")
+    message(FATAL_ERROR "ForgeCAD SDK source must be prepared with pinned dependency inputs")
+endif()
+if(NOT Python3_VERSION VERSION_EQUAL "3.11.9")
+    message(FATAL_ERROR "ForgeCAD SDK-private Python v1 requires CPython 3.11.9")
+endif()
