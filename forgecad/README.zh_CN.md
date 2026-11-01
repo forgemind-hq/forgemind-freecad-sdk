@@ -4,7 +4,7 @@
 
 本仓库基于官方 FreeCAD **1.1.3** 维护 ForgeCAD 的私有 Python 生命周期接口，并用独立的 **CPython 3.11.9** 编译 SDK，供 `forgemind-cad-compiler-freecad` 使用。普通 FreeCAD 发行包没有这套私有接口。
 
-编译器会使用同级的本仓库；默认目录缺失时，会自动克隆已发布的 `feat/forgecad-python-sdk` 分支。随后编译器可以自动准备原生依赖，无须再指向某位开发者的旧 FreeCAD 安装。准备流程会下载固定的源码归档和 Python wheel，核对 SHA-256，应用精确补丁，再编译配套的运行库。
+编译器会下载固定版本的 SDK Release，校验 SHA-256 和导出清单，再以该 SDK 构建自己的原生桥。SDK 仓库负责下载固定源码归档和 Python wheel、校验 SHA-256、应用精确补丁并编译配套运行库，因此无需依赖开发者机器上旧版 FreeCAD 的安装路径。
 
 ## 构建
 
@@ -36,7 +36,7 @@ cargo build --locked --features native-runtime --bins
 scripts/test-native.sh --test runtime_tests
 ```
 
-如果目录不同，设置 `FORGECAD_SDK_REPOSITORY`；需要独立构建缓存时设置 `FORGECAD_SDK_WORK`。显式配置 `FORGECAD_RUNTIME_LIBRARY` 时直接使用该桥接库。没有启用 `native-runtime` 的普通 Rust 构建不下载 SDK。
+编译器会从本仓库的 GitHub Release 下载固定 SDK 归档，并在构建原生桥前校验 SHA-256、FreeCAD 导出清单和私有 ABI。离线开发时可以显式提供本地 SDK。显式配置 `FORGECAD_RUNTIME_LIBRARY` 时直接使用该桥接库。没有启用 `native-runtime` 的普通 Rust 构建不下载 SDK。
 
 在 SDK 仓库中校验和打包：
 
@@ -46,6 +46,10 @@ python3 -E -B forgecad/sdk.py package --compiler-root ../forgemind-cad-compiler-
 ```
 
 压缩包及 SHA-256 文件写入 `dist/`。导出校验会检查目标平台、私有 ABI、文件摘要和 ELF 的实际导出符号；初始化与业务行为由编译器的原生测试单独验证。包保留构建主机的 glibc 基线，不承诺能在更旧的 Linux 发行版运行。
+
+## 二进制发布
+
+推送到 `forgemind/1.1.3-sdk-release` 会构建并验证 Linux x86_64 包，但不会发布。推送 `forgecad-sdk-v1.1.3-*` 格式的 tag 后，工作流会把验证通过的 tarball 和 `.sha256` 校验文件发布到公开 GitHub Release。Release 只包含 FreeCAD、CPython 和 Qt SDK/运行库，不含 `libforgecad_runtime.so`；编译器使用方会从私有编译器仓库构建该桥接库。
 
 ## 源码与补丁
 

@@ -4,7 +4,7 @@
 
 This fork builds the FreeCAD SDK used by `forgemind-cad-compiler-freecad`. A normal FreeCAD download does not provide ForgeCAD's private Python lifecycle interface. This repository maintains that interface on the official FreeCAD **1.1.3** source baseline and builds it with its own **CPython 3.11.9** instance.
 
-For example, a compiler checkout can build its native bridge without pointing to a developer's old FreeCAD installation. If the default sibling SDK directory is absent, the compiler clones the published `feat/forgecad-python-sdk` branch automatically. The SDK repository downloads fixed source archives and Python wheels, verifies their SHA-256 values, applies exact patches, and builds a matching runtime. The compiler then uses that runtime for builds and tests.
+For example, a compiler checkout can build its native bridge without pointing to a developer's old FreeCAD installation. The compiler downloads a fixed SDK release, checks its SHA-256 and export manifest, then builds its own native bridge against that SDK. The SDK repository downloads fixed source archives and Python wheels, verifies their SHA-256 values, applies exact patches, and builds a matching runtime.
 
 ## Build
 
@@ -36,7 +36,7 @@ cargo build --locked --features native-runtime --bins
 scripts/test-native.sh --test runtime_tests
 ```
 
-`FORGECAD_SDK_REPOSITORY` overrides the SDK repository location. `FORGECAD_SDK_WORK` selects its build workspace. An explicit `FORGECAD_RUNTIME_LIBRARY` bypasses automatic preparation. Default Rust builds without `native-runtime` do not download an SDK.
+The compiler fetches the pinned SDK archive from this repository's GitHub Release and verifies its SHA-256, export manifest and private ABI before building its own native bridge. An explicit local SDK can be supplied for offline development. An explicit `FORGECAD_RUNTIME_LIBRARY` bypasses automatic preparation. Default Rust builds without `native-runtime` do not download an SDK.
 
 Create and verify a standalone SDK archive:
 
@@ -46,6 +46,10 @@ python3 -E -B forgecad/sdk.py package --compiler-root ../forgemind-cad-compiler-
 ```
 
 The archive and its SHA-256 sidecar are written to `dist/`. The verifier checks the target, private ABI, file hashes and actual ELF exports; actual initialization and business behavior are verified separately by the compiler's native tests. The package retains the host glibc baseline, so it is not a promise of compatibility with older Linux distributions.
+
+## Binary releases
+
+Pushes to `forgemind/1.1.3-sdk-release` build and verify the Linux x86_64 package without publishing it. A tag named `forgecad-sdk-v1.1.3-*` publishes the verified tarball and its `.sha256` sidecar as a public GitHub Release. The release contains the FreeCAD, CPython and Qt SDK/runtime; it deliberately excludes `libforgecad_runtime.so`, which is built from the private compiler repository by the consumer.
 
 ## Source and patch maintenance
 
